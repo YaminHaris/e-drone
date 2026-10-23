@@ -20,6 +20,7 @@ find_package(controller_msg     REQUIRED)  # PID Tuning msg
 find_package(error_msg          REQUIRED)  # Error visualization msg
 find_package(whycode_interfaces REQUIRED)  # WhyCode interfaces
 find_package(std_msgs           REQUIRED)  # Header, for /controller_heartbeat
+find_package(waypoint_navigation REQUIRED)
 
 # --- mujoco_bridge (pre-built executable) ------------------------------------
 # Both files live in config/. The binary has RPATH=$ORIGIN, so libmujoco must be
@@ -74,6 +75,25 @@ install(
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Add the LQR controller and the waypoint service, client and server nodes below this line.
+# Task 2 action/service nodes.  They are installed as executables rather than
+# console entry points because this package uses ament_cmake.
+install(PROGRAMS src/pico_server.py DESTINATION lib/${PROJECT_NAME} RENAME pico_server)
+install(PROGRAMS src/pico_client.py DESTINATION lib/${PROJECT_NAME} RENAME pico_client)
+install(PROGRAMS src/waypoint_service.py DESTINATION lib/${PROJECT_NAME} RENAME waypoint_service)
+
+add_executable(pico_controller_LQR src/pico_controller_LQR.cpp)
+target_link_libraries(pico_controller_LQR Eigen3::Eigen)
+ament_target_dependencies(pico_controller_LQR
+  rclcpp swift_msgs error_msg whycode_interfaces std_msgs
+)
+install(TARGETS pico_controller_LQR DESTINATION lib/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(pico_lqr_math_test test/lqr_math_test.cpp)
+  target_include_directories(pico_lqr_math_test PRIVATE src)
+  target_link_libraries(pico_lqr_math_test Eigen3::Eigen)
+  add_test(NAME pico_lqr_math_test COMMAND pico_lqr_math_test)
+endif()
 
 ament_package()
