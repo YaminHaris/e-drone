@@ -11,7 +11,6 @@ compatibility mode for validating the prescribed Task 2B route:
 
 import itertools
 import json
-import math
 import threading
 
 import cv2
@@ -37,6 +36,7 @@ TASK2B_WAYPOINTS = (
     ('wp3', 1.20, -2.41),
     ('wp4', -1.20, 1.20),
 )
+TASK1A_REQUIRED_IDS = {80, 85, 90, 95}
 
 
 def make_pose(x, y, z=ALTITUDE):
@@ -56,10 +56,11 @@ def index_to_label(column, row):
     return f'{GRID_COLUMNS[column]}{row + 1}'
 
 
-def manhattan(left, right):
+def grid_distance(left, right):
+    """Euclidean distance between labelled grid intersections."""
     lx, ly = label_to_index(left)
     rx, ry = label_to_index(right)
-    return abs(lx - rx) + abs(ly - ry)
+    return ((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5
 
 
 def best_visit_order(survivors):
@@ -68,20 +69,24 @@ def best_visit_order(survivors):
         return []
     return list(min(
         itertools.permutations(sorted(set(survivors))),
-        key=lambda order: manhattan(START_LABEL, order[0]) +
-        sum(manhattan(order[i], order[i + 1]) for i in range(len(order) - 1))))
+        key=lambda order: grid_distance(START_LABEL, order[0]) +
+        sum(grid_distance(order[i], order[i + 1]) for i in range(len(order) - 1))))
 
 
 def append_grid_segment(route, start, finish, survivor_labels):
-    """Append a Manhattan segment; x/column is traversed before y/row."""
+    """Append the shortest 8-connected grid segment.
+
+    Each generated point is a grid intersection.  A diagonal step is allowed
+    when both coordinates change, which produces the sparse, natural route
+    shown in the task figure instead of an arbitrary L-shaped detour.
+    """
     column, row = label_to_index(start)
     finish_column, finish_row = label_to_index(finish)
-    while column != finish_column:
-        column += 1 if finish_column > column else -1
-        label = index_to_label(column, row)
-        route.append((label, label in survivor_labels))
-    while row != finish_row:
-        row += 1 if finish_row > row else -1
+    while column != finish_column or row != finish_row:
+        if column != finish_column:
+            column += 1 if finish_column > column else -1
+        if row != finish_row:
+            row += 1 if finish_row > row else -1
         label = index_to_label(column, row)
         route.append((label, label in survivor_labels))
 
@@ -106,82 +111,76 @@ def make_grid_route(survivors):
     return compact
 
 
-def _cluster(values, separation=4.0):
-    clusters = []
-    for value in sorted(values):
-        if not clusters or value - clusters[-1][-1] > separation:
-            clusters.append([value])
-        else:
-            clusters[-1].append(value)
-    return [float(np.mean(cluster)) for cluster in clusters]
+def task1a_detect_aruco(gray):
+    """Task 1A's version-compatible 4x4/250 ArUco detection."""
+    if hasattr(cv2.aruco, 'ArucoDetector'):
+        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+        detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
+        return detector.detectMarkers(gray)[:2]
+    dictionary = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_250)
+    parameters = cv2.aruco.DetectorParameters_create()
+    corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=parameters)
+    return corners, ids
 
 
-def _arena_grid_bounds(image):
-    """Infer the outer 12-cell grid rectangle from long Hough line segments."""
-    height, width = image.shape[:2]
-    edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 60, 160)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=70,
-                            minLineLength=int(min(height, width) * 0.45), maxLineGap=16)
-    if lines is None:
-        raise ValueError('arena grid lines were not detected')
-    vertical = []
-    horizontal = []
-    for x1, y1, x2, y2 in lines[:, 0]:
-        if abs(x1 - x2) <= 4 and abs(y2 - y1) >= height * 0.45:
-            vertical.append((x1 + x2) / 2.0)
-        if abs(y1 - y2) <= 4 and abs(x2 - x1) >= width * 0.45:
-            horizontal.append((y1 + y2) / 2.0)
-    vertical = _cluster(vertical)
-    horizontal = _cluster(horizontal)
-    if len(vertical) < 2 or len(horizontal) < 2:
-        raise ValueError('insufficient arena grid lines')
-    # The outside grid border is always the widest pair.  The inner eleven
-    # intersections are equally spaced at 1/12 .. 11/12 of this rectangle.
-    left, right = min(vertical), max(vertical)
-    top, bottom = min(horizontal), max(horizontal)
-    if right - left < width * 0.35 or bottom - top < height * 0.35:
-        raise ValueError('invalid arena grid geometry')
-    return left, top, right, bottom
+def task1a_arena_corners(corners, ids):
+    """Task 1A's inner-corner selection, ordered TL, TR, BR, BL."""
+    if ids is None:
+        raise ValueError('No marker detected')
+    marker_ids = ids.flatten().astype(int)
+    if not TASK1A_REQUIRED_IDS.issubset(set(marker_ids)):
+        raise ValueError('One or More Ids are missing')
+    marker_corners = {marker_id: corners[index][0]
+                      for index, marker_id in enumerate(marker_ids)}
+    marker_centres = {marker_id: np.mean(points, axis=0)
+                      for marker_id, points in marker_corners.items()}
+    arena_middle = np.mean(list(marker_centres.values()), axis=0)
+    inner_corner = {
+        marker_id: points[np.argmin([np.linalg.norm(point - arena_middle) for point in points])]
+        for marker_id, points in marker_corners.items()
+    }
+    by_y = sorted(marker_centres.items(), key=lambda item: item[1][1])
+    top = sorted(by_y[:2], key=lambda item: item[1][0])
+    bottom = sorted(by_y[2:], key=lambda item: item[1][0])
+    tl_id, tr_id = top[0][0], top[1][0]
+    bl_id, br_id = bottom[0][0], bottom[1][0]
+    return np.float32([inner_corner[tl_id], inner_corner[tr_id],
+                       inner_corner[br_id], inner_corner[bl_id]])
 
 
-def detect_critical_labels(image):
-    """Return nearest grid labels for red triangular critical-survivor tokens.
+def task1a_nearest_grid_label(cx, cy):
+    """Task 1A's nearest-intersection mapping on its 900 px rectified arena."""
+    column = int(np.clip(round(cx / 75.0), 1, 11))
+    row = int(np.clip(round(cy / 75.0), 1, 11))
+    return f"{chr(ord('A') + column - 1)}{row}"
 
-    This performs detection from the supplied frame; it does not contain arena
-    positions or survivor labels.  HSV avoids treating the blue/green terrain
-    texture as a survivor, and the polygon test separates critical triangles
-    from yellow circular stable survivors.
-    """
-    if image is None or image.size == 0:
-        raise ValueError('empty arena image')
-    left, top, right, bottom = _arena_grid_bounds(image)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    red = cv2.inRange(hsv, (0, 105, 70), (12, 255, 255))
-    red |= cv2.inRange(hsv, (165, 105, 70), (179, 255, 255))
-    red = cv2.morphologyEx(red, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    labels = []
+
+def task1a_contour_centres(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    centres = []
     for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 120.0:
+        if cv2.contourArea(contour) < 100:
             continue
-        perimeter = cv2.arcLength(contour, True)
-        vertices = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
-        if len(vertices) != 3:
-            continue
-        moments = cv2.moments(contour)
-        if moments['m00'] == 0:
-            continue
-        x = moments['m10'] / moments['m00']
-        y = moments['m01'] / moments['m00']
-        if not (left <= x <= right and top <= y <= bottom):
-            continue
-        # A..K occupy the inner 11 intersections of a 12-cell grid.
-        column = int(round((x - (left + (right - left) / 12.0)) / ((right - left) / 12.0)))
-        row = int(round((y - (top + (bottom - top) / 12.0)) / ((bottom - top) / 12.0)))
-        if 0 <= column < len(GRID_COLUMNS) and 0 <= row < len(GRID_ROWS):
-            labels.append(index_to_label(column, row))
-    return sorted(set(labels), key=label_to_index)
+        x, y, width, height = cv2.boundingRect(contour)
+        if width > 0 and height > 0:
+            centres.append((x + width / 2.0, y + height / 2.0))
+    return centres
+
+
+def task1a_critical_survivors(image):
+    """Embedded Task 1A pipeline: rectify, segment red, label intersections."""
+    if image is None or image.size == 0:
+        raise ValueError('Could not read image')
+    corners, ids = task1a_detect_aruco(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+    source = task1a_arena_corners(corners, ids)
+    destination = np.float32([[0, 0], [900, 0], [900, 900], [0, 900]])
+    warped = cv2.warpPerspective(image, cv2.getPerspectiveTransform(source, destination), (900, 900))
+    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([0, 150, 100]), np.array([10, 255, 255])),
+        cv2.inRange(hsv, np.array([170, 150, 100]), np.array([179, 255, 255])))
+    return sorted({task1a_nearest_grid_label(x, y)
+                   for x, y in task1a_contour_centres(red_mask)})
 
 
 def image_to_bgr(message):
@@ -243,7 +242,7 @@ class WayPoints(Node):
                 return
             self._planning = True
         try:
-            labels = detect_critical_labels(image_to_bgr(message))
+            labels = task1a_critical_survivors(image_to_bgr(message))
             if not labels:
                 raise ValueError('no critical triangular survivors detected')
             route = make_grid_route(labels)

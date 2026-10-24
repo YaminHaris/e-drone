@@ -48,7 +48,7 @@ install(
 
 # Looked up at runtime by waypoint_service.py via get_package_share_directory.
 install(
-  FILES src/grid_whycode_coordinates.json
+  FILES src/grid_whycode_coordinates.json scripts/task1a.py
   DESTINATION share/${PROJECT_NAME}/scripts
 )
 
