@@ -1,45 +1,45 @@
 #!/usr/bin/env python3
-"""Task 2 waypoint provider.
 
-Default ``auto`` mode consumes the one transient-local arena frame, detects red
-triangular (critical) survivors, maps them to grid intersections and plans a
-minimum-length Manhattan route from F6.  ``task2b`` is deliberately an explicit
-compatibility mode for validating the prescribed Task 2B route:
+"""
+Task 2C waypoint service.
 
-    ros2 run swift_pico waypoint_service --ros-args -p route_mode:=task2b
+Receives an arena image, detects critical survivors, plans a route
+through the grid, and provides the resulting waypoints to the client.
 """
 
-import itertools
 import json
+import itertools
 import threading
 
 import cv2
 import numpy as np
 import rclpy
+
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Pose, PoseArray
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import Image
 from waypoint_navigation.srv import GetWaypoints
 
 
-GRID_COLUMNS = 'ABCDEFGHIJK'
-GRID_ROWS = tuple(range(1, 12))
-START_LABEL = 'F6'
+# The arena has columns A-K and rows 1-11.
+GRID_COLUMNS = "ABCDEFGHIJK"
+START_LABEL = "F6"
 ALTITUDE = 13.0
-TASK2B_WAYPOINTS = (
-    ('wp1', -2.41, -2.41),
-    ('wp2', 2.41, 1.20),
-    ('wp3', 1.20, -2.41),
-    ('wp4', -1.20, 1.20),
-)
-TASK1A_REQUIRED_IDS = {80, 85, 90, 95}
+
+# These four ArUco markers identify the corners of the arena.
+REQUIRED_MARKER_IDS = {80, 85, 90, 95}
 
 
 def make_pose(x, y, z=ALTITUDE):
+    """Create a ROS pose at the given coordinates."""
     pose = Pose()
     pose.position.x = float(x)
     pose.position.y = float(y)
@@ -49,222 +49,388 @@ def make_pose(x, y, z=ALTITUDE):
 
 
 def label_to_index(label):
-    return GRID_COLUMNS.index(label[0]), int(label[1:]) - 1
+    """Convert a grid label such as F6 into zero-based indices."""
+    column = GRID_COLUMNS.index(label[0])
+    row = int(label[1:]) - 1
+    return column, row
 
 
 def index_to_label(column, row):
-    return f'{GRID_COLUMNS[column]}{row + 1}'
+    """Convert grid indices back into a label such as F6."""
+    return f"{GRID_COLUMNS[column]}{row + 1}"
 
 
-def grid_distance(left, right):
-    """Euclidean distance between labelled grid intersections."""
-    lx, ly = label_to_index(left)
-    rx, ry = label_to_index(right)
-    return ((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5
+def grid_distance(start, end):
+    """Calculate the distance between two grid intersections."""
+    x1, y1 = label_to_index(start)
+    x2, y2 = label_to_index(end)
+
+    return ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
 
 
 def best_visit_order(survivors):
-    """Exact TSP path (not a greedy approximation) for the small survivor set."""
+    """Find the shortest visiting order for the detected survivors."""
     if not survivors:
         return []
+
+    survivors = sorted(set(survivors))
+
     return list(min(
-        itertools.permutations(sorted(set(survivors))),
-        key=lambda order: grid_distance(START_LABEL, order[0]) +
-        sum(grid_distance(order[i], order[i + 1]) for i in range(len(order) - 1))))
+        itertools.permutations(survivors),
+        key=lambda order: (
+            grid_distance(START_LABEL, order[0])
+            + sum(
+                grid_distance(order[i], order[i + 1])
+                for i in range(len(order) - 1)
+            )
+        ),
+    ))
 
 
-def append_grid_segment(route, start, finish, survivor_labels):
-    """Append the shortest 8-connected grid segment.
-
-    Each generated point is a grid intersection.  A diagonal step is allowed
-    when both coordinates change, which produces the sparse, natural route
-    shown in the task figure instead of an arbitrary L-shaped detour.
-    """
+def append_grid_segment(route, start, end, survivors):
+    """Add grid intersections along a diagonal or straight path."""
     column, row = label_to_index(start)
-    finish_column, finish_row = label_to_index(finish)
-    while column != finish_column or row != finish_row:
-        if column != finish_column:
-            column += 1 if finish_column > column else -1
-        if row != finish_row:
-            row += 1 if finish_row > row else -1
+    end_column, end_row = label_to_index(end)
+
+    while column != end_column or row != end_row:
+        if column != end_column:
+            column += 1 if end_column > column else -1
+
+        if row != end_row:
+            row += 1 if end_row > row else -1
+
         label = index_to_label(column, row)
-        route.append((label, label in survivor_labels))
+        route.append((label, label in survivors))
 
 
 def make_grid_route(survivors):
-    """Return ``(grid-label, hover)`` pairs, including non-hover intersections."""
-    order = best_visit_order(survivors)
+    """
+    Build the complete route from F6 through the survivors.
+
+    Each entry contains a grid label and whether the drone should hover
+    there. Survivor locations require a hover; transit locations do not.
+    """
+    visit_order = best_visit_order(survivors)
     route = []
     current = START_LABEL
-    survivor_set = set(order)
-    for target in order:
-        append_grid_segment(route, current, target, survivor_set)
+    survivor_set = set(visit_order)
+
+    for target in visit_order:
+        append_grid_segment(
+            route, current, target, survivor_set
+        )
         current = target
-    # If a future survivor was crossed while travelling, the final arrival has
-    # still to be a hover waypoint.  Coalesce only adjacent duplicates.
-    compact = []
+
+    # Remove consecutive duplicate locations while preserving hover flags.
+    compact_route = []
+
     for label, is_survivor in route:
-        if compact and compact[-1][0] == label:
-            compact[-1] = (label, compact[-1][1] or is_survivor)
+        if compact_route and compact_route[-1][0] == label:
+            previous_label, previous_hover = compact_route[-1]
+            compact_route[-1] = (
+                previous_label,
+                previous_hover or is_survivor,
+            )
         else:
-            compact.append((label, is_survivor))
-    return compact
+            compact_route.append((label, is_survivor))
+
+    return compact_route
 
 
-def task1a_detect_aruco(gray):
-    """Task 1A's version-compatible 4x4/250 ArUco detection."""
-    if hasattr(cv2.aruco, 'ArucoDetector'):
-        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
-        detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
-        return detector.detectMarkers(gray)[:2]
-    dictionary = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_250)
-    parameters = cv2.aruco.DetectorParameters_create()
-    corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=parameters)
+def detect_aruco_markers(gray_image):
+    """Detect the arena markers across supported OpenCV versions."""
+    dictionary = cv2.aruco.getPredefinedDictionary(
+        cv2.aruco.DICT_4X4_250
+    )
+
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        detector = cv2.aruco.ArucoDetector(
+            dictionary,
+            cv2.aruco.DetectorParameters(),
+        )
+        corners, ids, _ = detector.detectMarkers(gray_image)
+    else:
+        parameters = cv2.aruco.DetectorParameters_create()
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray_image,
+            dictionary,
+            parameters=parameters,
+        )
+
     return corners, ids
 
 
-def task1a_arena_corners(corners, ids):
-    """Task 1A's inner-corner selection, ordered TL, TR, BR, BL."""
+def find_arena_corners(corners, ids):
+    """Find the four inner arena corners in TL, TR, BR, BL order."""
     if ids is None:
-        raise ValueError('No marker detected')
+        raise ValueError("No ArUco markers detected")
+
     marker_ids = ids.flatten().astype(int)
-    if not TASK1A_REQUIRED_IDS.issubset(set(marker_ids)):
-        raise ValueError('One or More Ids are missing')
-    marker_corners = {marker_id: corners[index][0]
-                      for index, marker_id in enumerate(marker_ids)}
-    marker_centres = {marker_id: np.mean(points, axis=0)
-                      for marker_id, points in marker_corners.items()}
-    arena_middle = np.mean(list(marker_centres.values()), axis=0)
-    inner_corner = {
-        marker_id: points[np.argmin([np.linalg.norm(point - arena_middle) for point in points])]
+
+    if not REQUIRED_MARKER_IDS.issubset(set(marker_ids)):
+        raise ValueError("One or more required arena markers are missing")
+
+    marker_corners = {
+        marker_id: corners[i][0]
+        for i, marker_id in enumerate(marker_ids)
+    }
+
+    # Find the centre of each marker and the centre of the arena.
+    centres = {
+        marker_id: np.mean(points, axis=0)
         for marker_id, points in marker_corners.items()
     }
-    by_y = sorted(marker_centres.items(), key=lambda item: item[1][1])
-    top = sorted(by_y[:2], key=lambda item: item[1][0])
-    bottom = sorted(by_y[2:], key=lambda item: item[1][0])
-    tl_id, tr_id = top[0][0], top[1][0]
-    bl_id, br_id = bottom[0][0], bottom[1][0]
-    return np.float32([inner_corner[tl_id], inner_corner[tr_id],
-                       inner_corner[br_id], inner_corner[bl_id]])
+    arena_centre = np.mean(list(centres.values()), axis=0)
+
+    # The corner closest to the arena centre is the inner corner.
+    inner_corners = {
+        marker_id: points[
+            np.argmin([
+                np.linalg.norm(point - arena_centre)
+                for point in points
+            ])
+        ]
+        for marker_id, points in marker_corners.items()
+    }
+
+    # Sort markers by vertical position, then horizontal position.
+    sorted_by_y = sorted(centres.items(), key=lambda item: item[1][1])
+    top = sorted(sorted_by_y[:2], key=lambda item: item[1][0])
+    bottom = sorted(sorted_by_y[2:], key=lambda item: item[1][0])
+
+    top_left = top[0][0]
+    top_right = top[1][0]
+    bottom_left = bottom[0][0]
+    bottom_right = bottom[1][0]
+
+    return np.float32([
+        inner_corners[top_left],
+        inner_corners[top_right],
+        inner_corners[bottom_right],
+        inner_corners[bottom_left],
+    ])
 
 
-def task1a_nearest_grid_label(cx, cy):
-    """Task 1A's nearest-intersection mapping on its 900 px rectified arena."""
-    column = int(np.clip(round(cx / 75.0), 1, 11))
-    row = int(np.clip(round(cy / 75.0), 1, 11))
+def nearest_grid_label(x, y):
+    """Map a point in the rectified image to its nearest grid intersection."""
+    column = int(np.clip(round(x / 75.0), 1, 11))
+    row = int(np.clip(round(y / 75.0), 1, 11))
+
     return f"{chr(ord('A') + column - 1)}{row}"
 
 
-def task1a_contour_centres(mask):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def find_contour_centres(mask):
+    """Find the centres of sufficiently large red regions."""
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
     centres = []
+
     for contour in contours:
         if cv2.contourArea(contour) < 100:
             continue
+
         x, y, width, height = cv2.boundingRect(contour)
+
         if width > 0 and height > 0:
-            centres.append((x + width / 2.0, y + height / 2.0))
+            centres.append((
+                x + width / 2.0,
+                y + height / 2.0,
+            ))
+
     return centres
 
 
-def task1a_critical_survivors(image):
-    """Embedded Task 1A pipeline: rectify, segment red, label intersections."""
+def detect_critical_survivors(image):
+    """Rectify the arena image and locate red survivors on the grid."""
     if image is None or image.size == 0:
-        raise ValueError('Could not read image')
-    corners, ids = task1a_detect_aruco(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
-    source = task1a_arena_corners(corners, ids)
-    destination = np.float32([[0, 0], [900, 0], [900, 900], [0, 900]])
-    warped = cv2.warpPerspective(image, cv2.getPerspectiveTransform(source, destination), (900, 900))
+        raise ValueError("Received an empty image")
+
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    corners, ids = detect_aruco_markers(gray_image)
+    source_corners = find_arena_corners(corners, ids)
+
+    # Transform the arena into a fixed 900 x 900 image.
+    destination_corners = np.float32([
+        [0, 0],
+        [900, 0],
+        [900, 900],
+        [0, 900],
+    ])
+
+    transform = cv2.getPerspectiveTransform(
+        source_corners,
+        destination_corners,
+    )
+    warped = cv2.warpPerspective(image, transform, (900, 900))
+
+    # Red is split into two ranges because it wraps around the HSV hue scale.
     hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-    red_mask = cv2.bitwise_or(
-        cv2.inRange(hsv, np.array([0, 150, 100]), np.array([10, 255, 255])),
-        cv2.inRange(hsv, np.array([170, 150, 100]), np.array([179, 255, 255])))
-    return sorted({task1a_nearest_grid_label(x, y)
-                   for x, y in task1a_contour_centres(red_mask)})
+
+    lower_red = cv2.inRange(
+        hsv,
+        np.array([0, 150, 100]),
+        np.array([10, 255, 255]),
+    )
+    upper_red = cv2.inRange(
+        hsv,
+        np.array([170, 150, 100]),
+        np.array([179, 255, 255]),
+    )
+
+    red_mask = cv2.bitwise_or(lower_red, upper_red)
+
+    return sorted({
+        nearest_grid_label(x, y)
+        for x, y in find_contour_centres(red_mask)
+    })
 
 
 def image_to_bgr(message):
-    height, width = message.height, message.width
-    if height == 0 or width == 0:
-        raise ValueError('received empty ROS image')
+    """Convert a ROS image message into an OpenCV BGR image."""
+    height = message.height
+    width = message.width
     encoding = message.encoding.lower()
-    channels = 3 if encoding in ('bgr8', 'rgb8') else 4 if encoding in ('bgra8', 'rgba8') else 1
-    raw = np.frombuffer(message.data, dtype=np.uint8).reshape(height, message.step)
-    image = raw[:, :width * channels].reshape(height, width, channels)
-    if encoding == 'bgr8':
+
+    if height == 0 or width == 0:
+        raise ValueError("Received an empty ROS image")
+
+    channels = {
+        "bgr8": 3,
+        "rgb8": 3,
+        "bgra8": 4,
+        "rgba8": 4,
+        "mono8": 1,
+        "8uc1": 1,
+    }.get(encoding)
+
+    if channels is None:
+        raise ValueError(f"Unsupported image encoding: {message.encoding}")
+
+    raw = np.frombuffer(message.data, dtype=np.uint8)
+    raw = raw.reshape(height, message.step)
+    image = raw[:, :width * channels].reshape(
+        height, width, channels
+    )
+
+    if encoding == "bgr8":
         return image.copy()
-    if encoding == 'rgb8':
+
+    if encoding == "rgb8":
         return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    if encoding == 'bgra8':
+
+    if encoding == "bgra8":
         return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-    if encoding == 'rgba8':
+
+    if encoding == "rgba8":
         return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-    if encoding in ('mono8', '8uc1'):
-        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    raise ValueError(f'unsupported image encoding: {message.encoding}')
+
+    return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
 
 class WayPoints(Node):
-    def __init__(self):
-        super().__init__('waypoints_service')
-        self._route_condition = threading.Condition()
-        self._route = None
-        self._route_ids = None
-        self._planning = False
-        self.image_sub = None
-        self.route_mode = self.declare_parameter('route_mode', 'auto').value
-        group = ReentrantCallbackGroup()
-        self.service = self.create_service(GetWaypoints, 'waypoints', self.waypoint_callback,
-                                           callback_group=group)
-        if self.route_mode == 'task2b':
-            self._set_task2b_route()
-        elif self.route_mode == 'auto':
-            qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
-            self.image_sub = self.create_subscription(Image, '/image_raw', self.image_callback, qos,
-                                                      callback_group=group)
-            self.get_logger().info('Waiting for the latched /image_raw arena frame')
-        else:
-            raise ValueError("route_mode must be 'auto' or 'task2b'")
 
-    def _set_task2b_route(self):
-        with self._route_condition:
-            self._route = [make_pose(x, y) for _, x, y in TASK2B_WAYPOINTS]
-            self._route_ids = [name for name, _, _ in TASK2B_WAYPOINTS]
-            self._route_condition.notify_all()
-        self.get_logger().info('Task 2B route loaded: wp1 -> wp2 -> wp3 -> wp4')
+    def __init__(self):
+        super().__init__("waypoints_service")
+
+        # The route is planned once an arena image arrives.
+        self.route_condition = threading.Condition()
+        self.route = None
+        self.marker_ids = None
+        self.planning = False
+
+        callback_group = ReentrantCallbackGroup()
+
+        # The simulator provides the arena image on this topic.
+        image_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        self.image_sub = self.create_subscription(
+            Image,
+            "/image_raw",
+            self.image_callback,
+            image_qos,
+            callback_group=callback_group,
+        )
+
+        # The client requests the planned route through this service.
+        self.service = self.create_service(
+            GetWaypoints,
+            "waypoints",
+            self.waypoint_callback,
+            callback_group=callback_group,
+        )
+
+        self.get_logger().info(
+            "Waiting for the arena image to plan the Task 2C route"
+        )
 
     def image_callback(self, message):
-        # A transient-local publisher can deliver once immediately after this
-        # subscriber is created.  Ignore a duplicate callback after planning.
-        with self._route_condition:
-            if self._route is not None or self._planning:
+        # Ignore duplicate frames while a route is being planned or is ready.
+        with self.route_condition:
+            if self.route is not None or self.planning:
                 return
-            self._planning = True
+
+            self.planning = True
+
         try:
-            labels = task1a_critical_survivors(image_to_bgr(message))
-            if not labels:
-                raise ValueError('no critical triangular survivors detected')
-            route = make_grid_route(labels)
-            coordinates_path = get_package_share_directory('swift_pico') + '/scripts/grid_whycode_coordinates.json'
-            with open(coordinates_path, encoding='utf-8') as coordinate_file:
-                coordinates = json.load(coordinate_file)
-            poses = [make_pose(coordinates[label]['x'], coordinates[label]['y']) for label, _ in route]
-            marker_ids = [('survivor:' if hover else 'transit:') + label for label, hover in route]
+            image = image_to_bgr(message)
+            survivors = detect_critical_survivors(image)
+
+            if not survivors:
+                raise ValueError("No critical survivors detected")
+
+            grid_route = make_grid_route(survivors)
+
+            # Convert grid labels into real WhyCode coordinates.
+            package_path = get_package_share_directory("swift_pico")
+            coordinates_path = (
+                package_path + "/scripts/grid_whycode_coordinates.json"
+            )
+
+            with open(coordinates_path, encoding="utf-8") as file:
+                coordinates = json.load(file)
+
+            poses = [
+                make_pose(
+                    coordinates[label]["x"],
+                    coordinates[label]["y"],
+                )
+                for label, _ in grid_route
+            ]
+
+            # The client uses these IDs to decide whether to hover.
+            marker_ids = [
+                ("survivor:" if is_survivor else "transit:") + label
+                for label, is_survivor in grid_route
+            ]
+
         except Exception as error:
-            with self._route_condition:
-                self._planning = False
-                self._route_condition.notify_all()
-            self.get_logger().error(f'Could not plan route from arena frame: {error}')
+            with self.route_condition:
+                self.planning = False
+                self.route_condition.notify_all()
+
+            self.get_logger().error(f"Route planning failed: {error}")
             return
 
-        with self._route_condition:
-            self._route = poses
-            self._route_ids = marker_ids
-            self._planning = False
-            self._route_condition.notify_all()
+        with self.route_condition:
+            self.route = poses
+            self.marker_ids = marker_ids
+            self.planning = False
+            self.route_condition.notify_all()
+
         self.get_logger().info(
-            f'Detected critical survivors {labels}; planned {len(poses)} grid waypoints from {START_LABEL}')
+            f"Detected survivors: {survivors}. "
+            f"Planned {len(poses)} waypoints from {START_LABEL}."
+        )
+
+        # The image is no longer needed after planning succeeds.
         if self.image_sub is not None:
             self.destroy_subscription(self.image_sub)
             self.image_sub = None
@@ -274,27 +440,38 @@ class WayPoints(Node):
             response.waypoints = PoseArray()
             response.marker_ids = []
             return response
-        # Do not answer early with an empty route.  A multi-threaded executor
-        # keeps the image callback alive while the service request waits.
-        with self._route_condition:
-            while self._route is None and rclpy.ok():
-                self._route_condition.wait(timeout=0.25)
-            poses = [] if self._route is None else list(self._route)
-            marker_ids = [] if self._route_ids is None else list(self._route_ids)
+
+        # If the client asks early, wait for image processing to finish.
+        with self.route_condition:
+            while self.route is None and rclpy.ok():
+                self.route_condition.wait(timeout=0.25)
+
+            poses = [] if self.route is None else list(self.route)
+            marker_ids = (
+                [] if self.marker_ids is None
+                else list(self.marker_ids)
+            )
+
         response.waypoints = PoseArray()
         response.waypoints.header.stamp = self.get_clock().now().to_msg()
-        response.waypoints.header.frame_id = 'whycode'
+        response.waypoints.header.frame_id = "whycode"
         response.waypoints.poses = poses
         response.marker_ids = marker_ids
-        self.get_logger().info(f'Returning {len(poses)} planned waypoints')
+
+        self.get_logger().info(
+            f"Returning {len(poses)} planned waypoints"
+        )
+
         return response
 
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = WayPoints()
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
+
     try:
         executor.spin()
     except KeyboardInterrupt:
@@ -304,5 +481,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

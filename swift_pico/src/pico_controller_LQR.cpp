@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include "error_msg/msg/error.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -138,11 +139,11 @@ bool has_valid_marker(const whycode_interfaces::msg::MarkerArray &msg) {
 class PicoController final : public rclcpp::Node {
  public:
   PicoController() : Node("pico_controller") {
-    target_ << declare_parameter("target_x", 1.0), declare_parameter("target_y", -1.0),
+    target_ << declare_parameter("target_x", 1.5), declare_parameter("target_y", -1.5),
         declare_parameter("target_z", 13.0);
 
     // Tuning knobs (all live ROS params so you can change them without rebuilding).
-    const double q_pos = declare_parameter("q_xy_position", 1.0);
+    const double q_pos = declare_parameter("q_xy_position", 5.0);
     const double q_vel = declare_parameter("q_xy_velocity", 1.0);
     const double r_tilt = declare_parameter("r_tilt", 100.0);
     alpha_ = declare_parameter("filter_alpha", 0.6);  // position trust in a new marker
@@ -159,6 +160,10 @@ class PicoController final : public rclcpp::Node {
     heartbeat_timer_ = create_wall_timer(100ms, std::bind(&PicoController::publish_heartbeat, this));
     control_timer_ = create_wall_timer(20ms, std::bind(&PicoController::control_step, this));
     publish_heartbeat();
+
+    // Let `ros2 param set /pico_controller target_x 0.0` move the setpoint live.
+    param_cb_ = add_on_set_parameters_callback(
+        std::bind(&PicoController::on_parameters, this, _1));
   }
 
  private:
@@ -180,6 +185,7 @@ class PicoController final : public rclcpp::Node {
 
   int startup_ticks_ = 0;
 
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
   rclcpp::Publisher<swift_msgs::msg::SwiftMsgs>::SharedPtr command_pub_;
   rclcpp::Publisher<error_msg::msg::Error>::SharedPtr error_pub_;
   rclcpp::Publisher<std_msgs::msg::Header>::SharedPtr heartbeat_pub_;
@@ -206,6 +212,38 @@ class PicoController final : public rclcpp::Node {
     } catch (const std::exception &e) {
       RCLCPP_ERROR(get_logger(), "LQR disabled: %s", e.what());
     }
+  }
+
+  // Only the target can change live. The LQR gains and filter settings are read
+  // once at startup, so changing those still needs a restart.
+  rcl_interfaces::msg::SetParametersResult on_parameters(
+      const std::vector<rclcpp::Parameter> &params) {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+
+    Eigen::Vector3d new_target = target_;
+    for (const auto &p : params) {
+      const std::string &name = p.get_name();
+      if (name != "target_x" && name != "target_y" && name != "target_z") continue;
+
+      const double value = p.as_double();
+      if (!std::isfinite(value)) {
+        result.successful = false;
+        result.reason = name + " must be finite";
+        return result;
+      }
+      if (name == "target_x") new_target(0) = value;
+      if (name == "target_y") new_target(1) = value;
+      if (name == "target_z") new_target(2) = value;
+    }
+
+    // Same executor thread as the control timer, so no locking needed.
+    if (new_target != target_) {
+      target_ = new_target;
+      RCLCPP_INFO(get_logger(), "New target [%.2f, %.2f, %.2f]",
+                  target_(0), target_(1), target_(2));
+    }
+    return result;
   }
 
   void publish_heartbeat() {

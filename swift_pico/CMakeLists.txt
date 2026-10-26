@@ -80,6 +80,7 @@ install(
 install(PROGRAMS src/pico_server.py DESTINATION lib/${PROJECT_NAME} RENAME pico_server)
 install(PROGRAMS src/pico_client.py DESTINATION lib/${PROJECT_NAME} RENAME pico_client)
 install(PROGRAMS src/waypoint_service.py DESTINATION lib/${PROJECT_NAME} RENAME waypoint_service)
+install(PROGRAMS src/waypoint_service_task2b.py DESTINATION lib/${PROJECT_NAME} RENAME waypoint_service_task2b)
 
 add_executable(pico_controller_LQR src/pico_controller_LQR.cpp)
 target_link_libraries(pico_controller_LQR Eigen3::Eigen)
