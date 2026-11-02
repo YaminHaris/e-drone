@@ -1,0 +1,6 @@
+# Request: where the drone is at the Switch (WhyCode coordinates).
+geometry_msgs/Point position
+---
+# Response: the stable route in flight order, ending at F6.
+geometry_msgs/PoseArray waypoints
+string[] marker_ids

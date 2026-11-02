@@ -8,6 +8,7 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/NavToWaypoint.action"
   "srv/GetWaypoints.srv"
+  "srv/GetStableRoute.srv"
   DEPENDENCIES geometry_msgs
 )
 

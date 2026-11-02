@@ -77,6 +77,7 @@ install(
 
 # Task 2 action/service nodes.  They are installed as executables rather than
 # console entry points because this package uses ament_cmake.
+install(PROGRAMS src/pico_controller_LQR.py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/pico_server.py DESTINATION lib/${PROJECT_NAME} RENAME pico_server)
 install(PROGRAMS src/pico_client.py DESTINATION lib/${PROJECT_NAME} RENAME pico_client)
 install(PROGRAMS src/waypoint_service.py DESTINATION lib/${PROJECT_NAME} RENAME waypoint_service)
